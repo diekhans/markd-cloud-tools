@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""s3du: recursive S3 lister with ncdu-like summaries, TSV output."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timezone
+from typing import Dict, Iterable, List, NamedTuple, Tuple
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
+
+###
+#  Exceptions
+###
+
+class UserError(Exception):
+    """User-facing error; print message only, no stack trace."""
+
+
+class AwsError(UserError):
+    """Wraps AWS/boto errors with a clean message."""
+
+###
+# Types
+###
+
+class ObjectMeta(NamedTuple):
+    bucket: str
+    key: str
+    storage_class: str
+    size: int
+    last_modified: str
+    etag: str
+
+
+class BucketStats:
+    """Tracks stats for a bucked or specific prefix within a bucket."""
+
+    __slots__ = ("bucket", "prefix", "storage_class", "objects", "bytes")
+
+    def __init__(self,
+                 bucket: str,
+                 prefix: str | None,
+                 storage_class: str):
+        self.bucket = bucket
+        self.prefix = prefix
+        self.storage_class = storage_class
+        self.objects: int = 0
+        self.bytes: int = 0
+
+    def add(self, size: int) -> None:
+        self.objects += 1
+        self.bytes += size
+
+    @property
+    def size_gb(self) -> str:
+        return f"{self.bytes / 1024 ** 3:.2f}"
+
+
+# ---------------- Args ---------------- #
+
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="s3du: recursive S3 lister (ncdu-like summaries)."
+    )
+    parser.add_argument("--bucket", help="Bucket to scan (default: all)")
+    parser.add_argument("--prefix", default="", help="Prefix within bucket")
+    parser.add_argument("--profile", help="AWS profile")
+    parser.add_argument("--region", help="AWS region")
+    parser.add_argument("--request-payer", choices=["requester"])
+    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--out-tsv", help="Write output TSV file")
+    parser.add_argument("--out-json", help="Write output JSON file")
+    parser.add_argument("--summary-bucket-tsv", help="Write bucket summary to TSV")
+    parser.add_argument("--depth", type=int, default=2)
+    parser.add_argument("--summary-prefix-tsv", help="Write previx summary to TSV")
+    return parser.parse_args()
+
+
+# ---------------- AWS ---------------- #
+
+def make_client(profile: str | None,
+                region: str | None):
+    if profile:
+        os.environ["AWS_PROFILE"] = profile
+    if region:
+        os.environ["AWS_DEFAULT_REGION"] = region
+    return boto3.client(
+        "s3", config=Config(retries={"max_attempts": 10, "mode": "adaptive"})
+    )
+
+
+def list_buckets(s3) -> List[str]:
+    try:
+        resp = s3.list_buckets()
+    except (BotoCoreError, ClientError) as exc:
+        raise AwsError("Failed to list buckets") from exc
+    return [b["Name"] for b in resp.get("Buckets", [])]
+
+def build_object_meta(bucket, obj_rec):
+    lm = obj_rec.get("LastModified")
+    return ObjectMeta(
+        bucket=bucket,
+        key=obj_rec["Key"],
+        size=int(obj_rec.get("Size", 0)),
+        storage_class=obj_rec.get("StorageClass", "") or "",
+        last_modified=(
+            lm.astimezone(timezone.utc).isoformat() if lm else ""
+        ),
+        etag=(obj_rec.get("ETag", "") or "").strip('"'),
+    )
+
+def list_page_reader(page, bucket):
+    for obj_rec in page.get("Contents", []):
+        yield build_object_meta(bucket, obj_rec)
+
+def list_objects(
+    s3, bucket: str,
+    prefix: str = "",
+    payer: str | None = None
+) -> Iterable[ObjectMeta]:
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+    except (BotoCoreError, ClientError) as exc:
+        raise AwsError(f"Failed to init paginator for {bucket}") from exc
+
+    kwargs = {"Bucket": bucket, "Prefix": prefix}
+    if payer:
+        kwargs["RequestPayer"] = payer
+
+    try:
+        for page in paginator.paginate(**kwargs):
+            yield from list_page_reader(page, bucket)
+    except (BotoCoreError, ClientError) as exc:
+        raise AwsError(f"Failed to list objects in {bucket}") from exc
+
+
+# ---------------- Summaries ---------------- #
+
+def summarize_buckets(rows: Iterable[ObjectMeta]) -> Dict[str, BucketStats]:
+    summary = {}
+    for r in rows:
+        key = (r.bucket, r.storage_class)
+        stats = summary.setdefault(key, BucketStats(r.bucket, None, r.storage_class))
+        stats.add(r.size)
+    return summary
+
+
+def summarize_prefixes(
+    rows: Iterable[ObjectMeta],
+    depth: int
+) -> Dict[Tuple[str, str], BucketStats]:
+    summary = {}
+    for r in rows:
+        parts = r.key.split("/")
+        prefix = "/".join(parts[:depth]) if parts else ""
+        key = (r.bucket, prefix, r.storage_class)
+        stats = summary.setdefault(key, BucketStats(r.bucket, prefix, r.storage_class))
+        stats.add(r.size)
+    return summary
+
+
+# ---------------- Output ---------------- #
+
+def write_tsv(rows: Iterable[ObjectMeta], path: str) -> None:
+    fields = ObjectMeta._fields
+    try:
+        with open(path, "w") as fh:
+            writer = csv.writer(fh, delimiter="\t", lineterminator="\n")
+            writer.writerow(fields)
+            for r in rows:
+                writer.writerow(r)
+    except OSError as exc:
+        raise UserError(f"Cannot write TSV: {path}") from exc
+
+
+def write_json(rows: Iterable[ObjectMeta], path: str) -> None:
+    try:
+        with open(path, "w") as fh:
+            json.dump([r._asdict() for r in rows], fh, indent=2)
+    except OSError as exc:
+        raise UserError(f"Cannot write JSON: {path}") from exc
+
+def write_summary_row(tsv_fh: csv.writer,
+                      headers: Tuple[str, ...],
+                      stats: BucketStats):
+    tsv_fh.writerow(
+        (getattr(stats, h) for h in headers)
+    )
+
+
+def write_summary_tsv(tsv_fh: csv.writer,
+                      summary: Dict[str, BucketStats],
+                      headers: Tuple[str, ...]):
+    """Write summary rows to a TSV with a header."""
+    for stats in sorted(summary.values(), key=lambda s: s.bytes, reverse=True):
+        tsv_fh.writerow((getattr(stats, h) for h in headers))
+
+def print_summary(summary: Dict[str, BucketStats],
+                  headers: Tuple[str, ...],
+                  path: str):
+    try:
+        with open(path, "w") as fh:
+            tsv_fh = csv.writer(fh, delimiter="\t", lineterminator="\n")
+            tsv_fh.writerow(headers)
+            write_summary_tsv(tsv_fh, summary, headers)
+    except OSError as exc:
+        raise UserError(f"Cannot write summary TSV: {path}") from exc
+
+
+def print_bucket_summary(
+    rows: List[ObjectMeta],
+    summary_tsv: str
+) -> None:
+    summary = summarize_buckets(rows)
+    headers = ("bucket", "storage_class", "objects", "size_gb")
+    print_summary(summary, headers, summary_tsv)
+
+
+def print_prefix_summary(
+    rows: List[ObjectMeta],
+    depth: int,
+    summary_tsv: str
+) -> None:
+    summary = summarize_prefixes(rows, depth)
+    headers = ("bucket", "prefix", "storage_class", "objects", "size_gb")
+    print_summary(summary, headers, summary_tsv)
+
+###
+# Guts
+###
+def gather_rows(s3, buckets: List[str],
+                prefix: str,
+                payer: str | None,
+                threads: int
+                ) -> List[ObjectMeta]:
+    out: List[ObjectMeta] = []
+    if not buckets:
+        raise UserError("No buckets found")
+
+    if len(buckets) == 1:
+        out.extend(list_objects(s3, buckets[0], prefix, payer))
+        return out
+
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
+        futs = {
+            ex.submit(list, list_objects(s3, b, "", payer)): b for b in buckets
+        }
+        for fut in as_completed(futs):
+            b = futs[fut]
+            try:
+                out.extend(fut.result())
+            except AwsError as exc:
+                raise AwsError(f"While scanning bucket: {b}") from exc
+    return out
+
+
+def s3_du(args):
+    s3 = make_client(args.profile, args.region)
+    buckets = [args.bucket] if args.bucket else list_buckets(s3)
+    rows = gather_rows(s3, buckets, args.prefix, args.request_payer, args.threads)
+
+    if args.out_tsv:
+        write_tsv(rows, args.out_tsv)
+    if args.out_json:
+        write_json(rows, args.out_json)
+    if args.summary_bucket_tsv:
+        print_bucket_summary(rows, args.summary_bucket_tsv)
+    if args.summary_prefix_tsv:
+        print_prefix_summary(rows, args.depth, args.summary_prefix_tsv)
+
+def main():
+    args = get_args()
+    try:
+        s3_du(args)
+    except UserError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        exit(2)
+
+
+main()
