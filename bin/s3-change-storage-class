@@ -2,6 +2,7 @@
 import argparse, csv, sys, time, fnmatch, logging, concurrent.futures as cf
 from datetime import datetime, timedelta, timezone
 import boto3
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 from boto3.s3.transfer import TransferConfig
 
@@ -22,7 +23,7 @@ def parse_args():
     p.add_argument("--report", default="s3_transition_report.tsv", help="TSV report path")
     p.add_argument("--region", default=None, help="AWS region")
     p.add_argument("--profile", default=None, help="AWS profile (select account)")
-    p.add_argument("--log", default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)")
+    p.add_argument("--log", default="WARN", help="Logging level (DEBUG, INFO, WARN, ERROR)")
     return p.parse_args()
 
 
@@ -115,7 +116,8 @@ def main():
     log = logging.getLogger("s3-archive")
 
     session = boto3.session.Session(profile_name=args.profile, region_name=args.region)
-    s3c = session.client("s3")
+    s3c = session.client("s3",
+                         config=BotoConfig(max_pool_connections=2 * args.max_workers))
     cfg = TransferConfig(multipart_threshold=64*1024*1024,
                          multipart_chunksize=64*1024*1024,
                          max_concurrency=8)
