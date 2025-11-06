@@ -23,7 +23,7 @@ def parse_args():
     p.add_argument("--report", default="s3_transition_report.tsv", help="TSV report path")
     p.add_argument("--region", default=None, help="AWS region")
     p.add_argument("--profile", default=None, help="AWS profile (select account)")
-    p.add_argument("--log", default="WARN", help="Logging level (DEBUG, INFO, WARN, ERROR)")
+    p.add_argument("--log", default="INFO", help="Logging level (DEBUG, INFO, WARN, ERROR)")
     return p.parse_args()
 
 
