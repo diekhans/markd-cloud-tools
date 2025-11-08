@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-import argparse, csv, sys, time, fnmatch, logging, concurrent.futures as cf
+import argparse
+import csv
+import sys
+import time
+import fnmatch
+import logging
+import concurrent.futures as cf
 from datetime import datetime, timedelta, timezone
 import boto3
+from boto3.s3.transfer import TransferConfig
+import botocore
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
-from boto3.s3.transfer import TransferConfig
 
 # originally by ChatGPT
 
@@ -23,7 +30,9 @@ def parse_args():
     p.add_argument("--report", default="s3_transition_report.tsv", help="TSV report path")
     p.add_argument("--region", default=None, help="AWS region")
     p.add_argument("--profile", default=None, help="AWS profile (select account)")
-    p.add_argument("--log", default="INFO", help="Logging level (DEBUG, INFO, WARN, ERROR)")
+    p.add_argument("--mfa-code", default=None, help="MFA code to avoid prompting")
+    p.add_argument("--log", default="INFO", choices=('DEBUG', 'INFO', 'WARN', 'ERROR'),
+                   help="Logging level")
     return p.parse_args()
 
 
@@ -74,7 +83,7 @@ def process_one(s3c, cfg, args, cutoff, bucket, obj):
     try:
         t0 = time.time()
         copy_set_storage_class(s3c, bucket, key, args.to, cfg)
-        dt = f"{time.time()-t0:.2f}s"
+        dt = f"{time.time() - t0:.2f}s"
         return ("OK", bucket, key, size, sc_now, args.to, dt)
     except ClientError as e:
         return ("ERR", bucket, key, size, sc_now, "-", str(e))
@@ -105,9 +114,60 @@ def run_transitions(args, s3c, cfg, cutoff, log):
 
 
 # ---------- MAIN ----------
-def main():
-    args = parse_args()
+def create_mfa_session(args):
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
 
+    # Read profile config to get MFA serial and role ARN
+    config = botocore.session.Session()
+    profile_config = config.full_config.get('profiles', {}).get(args.profile, {})
+
+    mfa_serial = profile_config.get('mfa_serial')
+    role_arn = profile_config.get('role_arn')
+
+    if not mfa_serial:
+        raise Exception("No mfa_serial configured in profile")
+
+    # Create STS client with base credentials
+    sts = boto3.client('sts')
+
+    if role_arn:
+        # Assume role with MFA
+        response = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName='session',
+            SerialNumber=mfa_serial,
+            TokenCode=args.mfa_code,
+            DurationSeconds=int(profile_config.get('duration_seconds', 3600))
+        )
+    else:
+        # Get session token with MFA
+        response = sts.get_session_token(
+            SerialNumber=mfa_serial,
+            TokenCode=args.mfa_code,
+            DurationSeconds=int(profile_config.get('duration_seconds', 43200))
+        )
+
+    credentials = response['Credentials']
+
+    # Create session with temporary credentials
+    return boto3.Session(
+        aws_access_key_id=credentials['AccessKeyId'],
+        aws_secret_access_key=credentials['SecretAccessKey'],
+        aws_session_token=credentials['SessionToken'],
+        region_name=profile_config.get('region')
+    )
+    return session
+
+def create_s3_client(args):
+    if args.mfa_code is not None:
+        session = create_mfa_session(args)
+    else:
+        session = boto3.session.Session(profile_name=args.profile, region_name=args.region)
+
+    return session.client("s3",
+                          config=BotoConfig(max_pool_connections=8 * args.max_workers))
+
+def change_storage_class(args):
     logging.basicConfig(
         level=getattr(logging, args.log.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -115,11 +175,11 @@ def main():
     )
     log = logging.getLogger("s3-archive")
 
-    session = boto3.session.Session(profile_name=args.profile, region_name=args.region)
-    s3c = session.client("s3",
-                         config=BotoConfig(max_pool_connections=2 * args.max_workers))
-    cfg = TransferConfig(multipart_threshold=64*1024*1024,
-                         multipart_chunksize=64*1024*1024,
+    s3c = create_s3_client(args)
+
+    mp_size = 64 * 1024 * 1024
+    cfg = TransferConfig(multipart_threshold=mp_size,
+                         multipart_chunksize=mp_size,
                          max_concurrency=8)
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.older_than_days)
 
@@ -127,8 +187,8 @@ def main():
 
     # TSV report
     with open(args.report, "w", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t")
-        w.writerow(["status","bucket","key","bytes","from_sc","to_sc","info"])
+        w = csv.writer(fh, delimiter="\t", lineterminator='\n')
+        w.writerow(["status", "bucket", "key", "bytes", "from_sc", "to_sc", "info"])
         w.writerows(rows)
 
     ok = sum(1 for x in rows if x[0] == "OK")
@@ -136,6 +196,18 @@ def main():
     skipped = len(rows) - ok - err
     log.info(f"Done. OK={ok} ERRORS={err} SKIPPED={skipped}. Report: {args.report}")
 
+
+def main():
+    args = parse_args()
+
+    try:
+        change_storage_class(args)
+    except ClientError as exc:
+        # FIXME: hack
+        if args.log == 'DEBUG':
+            raise
+        print(f"Error: {exc}", file=sys.stderr)
+        exit(1)
 
 if __name__ == "__main__":
     main()
