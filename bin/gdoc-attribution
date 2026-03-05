@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+gdoc_attribution.py — Attribute each line of a Google Doc to its last editor.
+
+SETUP (one-time):
+  1. Enable Google Drive API at https://console.cloud.google.com
+  2. Create OAuth 2.0 credentials (Desktop app), save as credentials.json
+  3. pip install google-auth google-auth-oauthlib google-api-python-client requests
+
+USAGE:
+  python gdoc_attribution.py <DOC_ID_OR_URL> [-o OUTPUT_FILE]
+"""
+
+import argparse
+import datetime
+import difflib
+import os
+import sys
+
+# pip install google-auth google-auth-oauthlib google-api-python-client requests
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+import requests as req_lib
+
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+CONFIG_DIR = os.path.expanduser("~/.config/gcloud")
+TOKEN_FILE = os.path.join(CONFIG_DIR, "gdocs-tools-token.json")
+CREDS_FILE = os.path.join(CONFIG_DIR, "gdocs-tools-credentials.json")
+
+
+# --- Auth ---
+
+def authenticate() -> Credentials:
+    creds = None
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_FILE, "w") as f:
+            f.write(creds.to_json())
+    return creds
+
+
+# --- Google Drive helpers ---
+
+def parse_doc_id(url_or_id: str) -> str:
+    if "docs.google.com" in url_or_id:
+        parts = url_or_id.split("/")
+        try:
+            return parts[parts.index("d") + 1]
+        except (ValueError, IndexError):
+            sys.exit("Could not parse document ID from URL.")
+    return url_or_id.strip()
+
+
+def get_revisions(service, doc_id: str) -> list[dict]:
+    revisions, page_token = [], None
+    while True:
+        resp = service.revisions().list(
+            fileId=doc_id,
+            fields="nextPageToken,revisions(id,modifiedTime,lastModifyingUser)",
+            pageToken=page_token,
+        ).execute()
+        revisions.extend(resp.get("revisions", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return revisions
+
+
+def export_revision_text(session, doc_id: str, revision_id: str) -> str:
+    url = (
+        f"https://www.googleapis.com/drive/v3/files/{doc_id}/export"
+        f"?mimeType=text/plain&revisionId={revision_id}"
+    )
+    resp = session.get(url)
+    return resp.text if resp.status_code == 200 else ""
+
+
+# --- Attribution logic ---
+
+def attribute_lines(revisions: list[dict], texts: list[str]) -> list[tuple]:
+    """
+    Diff consecutive revisions and track the last author to touch each line.
+    Returns list of (line_text, author, iso_timestamp).
+    """
+    prev_lines = []
+    line_authors: dict[int, tuple[str, str]] = {}
+
+    for rev, text in zip(revisions, texts):
+        author = rev.get("lastModifyingUser", {}).get("displayName", "Unknown")
+        timestamp = rev.get("modifiedTime", "")
+        curr_lines = text.splitlines()
+
+        new_authors: dict[int, tuple[str, str]] = {}
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, prev_lines, curr_lines).get_opcodes():
+            if tag == "equal":
+                for old, new in zip(range(i1, i2), range(j1, j2)):
+                    new_authors[new] = line_authors.get(old, (author, timestamp))
+            elif tag in ("replace", "insert"):
+                for new in range(j1, j2):
+                    new_authors[new] = (author, timestamp)
+
+        line_authors = new_authors
+        prev_lines = curr_lines
+
+    final_lines = texts[-1].splitlines() if texts else []
+    return [
+        (line, *line_authors.get(i, ("Unknown", "")))
+        for i, line in enumerate(final_lines)
+    ]
+
+
+# --- Output ---
+
+def format_ts(iso: str) -> str:
+    try:
+        dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return iso
+
+
+def write_output(attribution: list[tuple], dest):
+    header = f"{'#':<5}  {'AUTHOR':<28}  {'DATE':<20}  TEXT"
+    rule = "-" * 100
+    dest.write(header + "\n")
+    dest.write(rule + "\n")
+    for i, (line, author, ts) in enumerate(attribution, 1):
+        dest.write(f"{i:<5}  {author:<28}  {format_ts(ts):<20}  {line}\n")
+
+
+# --- Main ---
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Attribute Google Doc lines to their last editor.")
+    p.add_argument("doc", help="Google Doc URL or file ID")
+    p.add_argument("-o", "--output", default="line_attribution.txt",
+                   help="Output file (default: line_attribution.txt)")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    doc_id = parse_doc_id(args.doc)
+
+    creds = authenticate()
+    service = build("drive", "v3", credentials=creds)
+    session = req_lib.Session()
+    session.headers["Authorization"] = f"Bearer {creds.token}"
+
+    print(f"Document ID : {doc_id}")
+    revisions = get_revisions(service, doc_id)
+    print(f"Revisions   : {len(revisions)}")
+
+    if not revisions:
+        sys.exit("No revisions found — check permissions.")
+
+    texts = []
+    for i, rev in enumerate(revisions, 1):
+        text = export_revision_text(session, doc_id, rev["id"])
+        texts.append(text or (texts[-1] if texts else ""))
+        author = rev.get("lastModifyingUser", {}).get("displayName", "?")
+        print(f"  [{i:>3}/{len(revisions)}] {rev['modifiedTime'][:10]}  {author}")
+
+    attribution = attribute_lines(revisions, texts)
+
+    write_output(attribution, sys.stdout)
+
+    with open(args.output, "w", encoding="utf-8") as f:
+        write_output(attribution, f)
+
+    print(f"\nSaved: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
